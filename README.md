@@ -41,6 +41,16 @@ Or use the helper script:
 ./run.sh
 ```
 
+## Download A Release
+
+Download the latest `ContainerReview-*-macOS.zip` from the
+[GitHub releases page](https://github.com/ChrisMasterton/container-review/releases),
+unzip it, and move `Container Review.app` wherever you keep local apps.
+
+The packaged app is currently unsigned and not notarized. macOS may ask you to
+confirm that you want to open it. You can also build from source if you prefer
+to run a local build.
+
 ## Build A macOS App Bundle
 
 ```bash
@@ -50,6 +60,14 @@ open ".build/Container Review.app"
 
 The build script compiles the release executable, generates a native app icon,
 and writes a clickable `.app` bundle to `.build/Container Review.app`.
+
+To create a release zip locally:
+
+```bash
+./package-release.sh 0.1.0
+```
+
+This writes `dist/ContainerReview-0.1.0-macOS.zip` and a matching SHA-256 file.
 
 ## Safety And Privacy
 
@@ -68,10 +86,11 @@ Useful commands:
 swift build
 swift run
 ./build-app.sh
+./package-release.sh 0.1.0
 ```
 
 The generated build products live under `.build/` and are intentionally ignored
-by git.
+by git. Local release zips live under `dist/`, which is also ignored.
 
 ## License
 
