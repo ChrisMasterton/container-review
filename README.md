@@ -11,13 +11,13 @@ logs for the selected container.
 ## Features
 
 - Refreshes the local container list every 4 seconds.
-- Shows container name, image, state, status, uptime, ports, and Compose labels.
+- Shows container name, image, state, status, creation age, ports, and Compose labels.
 - Displays richer metadata from `docker inspect` when you select a container.
 - Shows bounded logs with `docker logs --tail <N> --timestamps`.
 - Keeps log following off by default; when enabled, the selected container's log
   tail refreshes every 2 seconds.
 - Opens mapped HTTP ports in the browser when Docker reports host bindings.
-- Stops only the selected container by calling `docker stop <container-id>`.
+- Stops only the selected container with `docker stop <container-id>` and verifies the stopped state.
 
 ## Requirements
 
@@ -75,8 +75,9 @@ Container Review is local-only. It does not send container information anywhere.
 It shells out to the local Docker CLI for container lists, inspection data, logs,
 and stop actions.
 
-The destructive action in the UI is scoped to the currently selected container:
-stopping a container calls `docker stop` with that container's ID.
+The destructive action in the UI is scoped to the target container: stopping a
+container calls `docker stop` with that container's ID and then verifies the
+post-stop state with `docker inspect`.
 
 ## Development
 

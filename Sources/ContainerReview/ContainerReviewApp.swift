@@ -41,6 +41,10 @@ struct ContainerSummary: Identifiable, Equatable {
         ports.isEmpty ? "-" : ports
     }
 
+    var createdAgeText: String {
+        runningFor.isEmpty ? "-" : "Created \(runningFor)"
+    }
+
     var isRunning: Bool {
         state.localizedCaseInsensitiveContains("running")
     }
@@ -128,6 +132,14 @@ struct ContainerDetail: Equatable {
 
     var workingDirectory: String? {
         labels["com.docker.compose.project.working_dir"]
+    }
+
+    var isRunning: Bool {
+        state.localizedCaseInsensitiveContains("running")
+    }
+
+    var stateLabel: String {
+        state.isEmpty ? "not running" : state.capitalized
     }
 }
 
@@ -343,7 +355,7 @@ enum ContainerSortOrder: String, CaseIterable, Identifiable {
     case name
     case project
     case image
-    case uptime
+    case created
 
     var id: Self { self }
 
@@ -352,7 +364,7 @@ enum ContainerSortOrder: String, CaseIterable, Identifiable {
         case .name: "Name"
         case .project: "Project"
         case .image: "Image"
-        case .uptime: "Uptime"
+        case .created: "Created"
         }
     }
 
@@ -361,7 +373,7 @@ enum ContainerSortOrder: String, CaseIterable, Identifiable {
         case .name: "textformat"
         case .project: "shippingbox"
         case .image: "square.stack.3d.up"
-        case .uptime: "clock.arrow.circlepath"
+        case .created: "calendar"
         }
     }
 }
@@ -476,8 +488,16 @@ enum DockerRunner {
         ])
     }
 
-    static func stop(id: String) async throws {
+    static func stop(id: String) async throws -> ContainerDetail {
         _ = try await ToolRunner.run(docker, arguments: ["stop", id])
+        let detail = try await inspect(id: id)
+        if detail.isRunning {
+            throw CommandError.commandFailed(
+                command: "docker stop \(id)",
+                detail: "Docker reported success, but \(detail.shortID) is still \(detail.stateLabel)."
+            )
+        }
+        return detail
     }
 
     static func statusText() async -> String {
@@ -507,6 +527,7 @@ final class ContainerStore: ObservableObject {
     @Published var isRefreshing = false
     @Published var isLoadingDetail = false
     @Published var isLoadingLogs = false
+    @Published var isStopping = false
     @Published var followLogs = false {
         didSet { updateLogFollower() }
     }
@@ -515,13 +536,17 @@ final class ContainerStore: ObservableObject {
         didSet { containers = sorted(containers) }
     }
     @Published var scope: ContainerScope = .running {
-        didSet { refresh() }
+        didSet {
+            guard !isUpdatingScopeWithoutRefresh else { return }
+            refresh()
+        }
     }
     @Published var query = ""
 
     private var refreshTask: Task<Void, Never>?
     private var logFollowTask: Task<Void, Never>?
     private var lastDetailID: ContainerSummary.ID?
+    private var isUpdatingScopeWithoutRefresh = false
 
     var selectedContainer: ContainerSummary? {
         containers.first { $0.id == selectedContainerID }
@@ -559,29 +584,8 @@ final class ContainerStore: ObservableObject {
     }
 
     func refresh() {
-        isRefreshing = true
         Task {
-            do {
-                let next = sorted(try await DockerRunner.listContainers(scope: scope))
-                containers = next
-                if let selectedContainerID, !next.contains(where: { $0.id == selectedContainerID }) {
-                    self.selectedContainerID = nil
-                    detail = nil
-                    logs = ""
-                    lastDetailID = nil
-                }
-                statusText = next.isEmpty
-                    ? "No containers found"
-                    : "\(next.count) container\(next.count == 1 ? "" : "s") shown"
-                refreshSelectedDetailIfNeeded()
-            } catch {
-                containers = []
-                selectedContainerID = nil
-                detail = nil
-                logs = ""
-                statusText = error.localizedDescription
-            }
-            isRefreshing = false
+            await reloadContainers(scope: scope)
         }
     }
 
@@ -649,17 +653,70 @@ final class ContainerStore: ObservableObject {
 
     func stopSelected() {
         guard let selectedContainerID else { return }
+        stop(selectedContainerID)
+    }
+
+    func stop(_ id: ContainerSummary.ID) {
+        guard !isStopping else { return }
+        let displayName = containers.first { $0.id == id }?.displayName ?? String(id.prefix(12))
+        selectedContainerID = id
+        detail = nil
+        logs = ""
+        lastDetailID = nil
+        statusText = "Stopping \(displayName)..."
+        isStopping = true
         Task {
+            defer { isStopping = false }
             do {
-                try await DockerRunner.stop(id: selectedContainerID)
-                statusText = "Stopped \(selectedContainer?.displayName ?? selectedContainerID)"
-                detail = nil
+                let stoppedDetail = try await DockerRunner.stop(id: id)
+                let nextScope = scope == .running ? ContainerScope.all : scope
+                setScopeWithoutRefresh(nextScope)
+                detail = stoppedDetail
                 logs = ""
-                refresh()
+                lastDetailID = id
+                await reloadContainers(
+                    scope: nextScope,
+                    statusOverride: "Stopped \(displayName); verified \(stoppedDetail.stateLabel)."
+                )
+                detail = stoppedDetail
+                await refreshLogs()
             } catch {
                 statusText = error.localizedDescription
             }
         }
+    }
+
+    private func reloadContainers(scope requestedScope: ContainerScope, statusOverride: String? = nil) async {
+        isRefreshing = true
+        defer { isRefreshing = false }
+
+        do {
+            let next = sorted(try await DockerRunner.listContainers(scope: requestedScope))
+            containers = next
+            if let selectedContainerID, !next.contains(where: { $0.id == selectedContainerID }) {
+                self.selectedContainerID = nil
+                detail = nil
+                logs = ""
+                lastDetailID = nil
+            }
+            statusText = statusOverride ?? (next.isEmpty
+                ? "No containers found"
+                : "\(next.count) container\(next.count == 1 ? "" : "s") shown")
+            refreshSelectedDetailIfNeeded()
+        } catch {
+            containers = []
+            selectedContainerID = nil
+            detail = nil
+            logs = ""
+            statusText = error.localizedDescription
+        }
+    }
+
+    private func setScopeWithoutRefresh(_ nextScope: ContainerScope) {
+        guard scope != nextScope else { return }
+        isUpdatingScopeWithoutRefresh = true
+        scope = nextScope
+        isUpdatingScopeWithoutRefresh = false
     }
 
     private func updateLogFollower() {
@@ -689,7 +746,7 @@ final class ContainerStore: ObservableObject {
                     lhs.image == rhs.image &&
                     compare(lhs.displayName, rhs.displayName)
                 )
-            case .uptime:
+            case .created:
                 compare(lhs.runningFor, rhs.runningFor) || (
                     lhs.runningFor == rhs.runningFor &&
                     compare(lhs.displayName, rhs.displayName)
@@ -722,7 +779,8 @@ struct ContentView: View {
                                 Button("Copy Container ID") { store.copySelectedID() }
                                 Button("Open First Port") { store.openFirstPort() }
                                     .disabled(store.detail?.ports.compactMap(\.url).isEmpty ?? true)
-                                Button("Stop Container", role: .destructive) { store.stopSelected() }
+                                Button("Stop Container", role: .destructive) { store.stop(container.id) }
+                                    .disabled(store.isStopping || !container.isRunning)
                             }
                     }
                 }
@@ -768,7 +826,7 @@ struct ContentView: View {
                 } label: {
                     Label("Stop", systemImage: "stop.circle")
                 }
-                .disabled(store.selectedContainer == nil)
+                .disabled(store.selectedContainer?.isRunning != true || store.isStopping)
             }
         }
         .searchable(text: $store.query, placement: .sidebar, prompt: "Filter containers")
@@ -826,7 +884,7 @@ struct ContainerRow: View {
                     .lineLimit(1)
 
                 HStack(spacing: 10) {
-                    Label(container.runningFor, systemImage: "clock")
+                    Label(container.createdAgeText, systemImage: "calendar")
                     Label(container.portSummary, systemImage: "network")
                 }
                 .font(.caption2)
@@ -919,6 +977,7 @@ struct DetailHeader: View {
                 Button(role: .destructive) { store.stopSelected() } label: {
                     Label("Stop Container", systemImage: "stop.circle")
                 }
+                .disabled(store.isStopping || !container.isRunning)
             }
             .controlSize(.regular)
         }
