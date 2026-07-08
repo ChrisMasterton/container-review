@@ -51,10 +51,23 @@ The packaged app is currently unsigned and not notarized. macOS may ask you to
 confirm that you want to open it. You can also build from source if you prefer
 to run a local build.
 
+## Install From Source
+
+```bash
+./scripts/install.sh
+```
+
+This builds the app bundle and installs it to `/Applications`. To install
+somewhere else, set `INSTALL_DIR`, for example:
+
+```bash
+INSTALL_DIR="$HOME/Applications" ./scripts/install.sh
+```
+
 ## Build A macOS App Bundle
 
 ```bash
-./build-app.sh
+./scripts/build-app.sh
 open ".build/Container Review.app"
 ```
 
@@ -64,10 +77,16 @@ and writes a clickable `.app` bundle to `.build/Container Review.app`.
 To create a release zip locally:
 
 ```bash
-./package-release.sh 0.1.0
+./package-release.sh
 ```
 
-This writes `dist/ContainerReview-0.1.0-macOS.zip` and a matching SHA-256 file.
+This reads the default version from `VERSION`, writes
+`dist/ContainerReview-0.1.1-macOS.zip`, and creates a matching SHA-256 file.
+Pass another version if you are preparing a different release:
+
+```bash
+./package-release.sh v0.1.1
+```
 
 ## Safety And Privacy
 
@@ -86,8 +105,9 @@ Useful commands:
 ```bash
 swift build
 swift run
-./build-app.sh
-./package-release.sh 0.1.0
+./scripts/build-app.sh
+./scripts/install.sh
+./package-release.sh
 ```
 
 The generated build products live under `.build/` and are intentionally ignored

@@ -2,7 +2,18 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$script_dir"
+repo_dir="$(cd "${script_dir}/.." && pwd)"
+cd "$repo_dir"
+
+version="${1:-${CONTAINER_REVIEW_VERSION:-}}"
+if [[ -z "$version" ]]; then
+    version="$(< "${repo_dir}/VERSION")"
+fi
+version="${version#v}"
+if [[ -z "$version" ]]; then
+    echo "Release version is required." >&2
+    exit 1
+fi
 
 swift build -c release
 
@@ -21,7 +32,7 @@ rm -rf "$iconset_dir"
 swift Tools/generate-app-icon.swift "$iconset_dir"
 iconutil -c icns "$iconset_dir" -o "${resources_dir}/AppIcon.icns"
 
-cat > "${contents_dir}/Info.plist" <<'PLIST'
+cat > "${contents_dir}/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -39,7 +50,7 @@ cat > "${contents_dir}/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>${version}</string>
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
