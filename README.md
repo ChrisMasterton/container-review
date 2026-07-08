@@ -1,12 +1,13 @@
 # Container Review
 
 Container Review is a small native macOS utility for inspecting local Docker
-containers. It is built with SwiftUI and is especially handy on machines where
-Docker runs through Colima instead of Docker Desktop.
+containers and listening local TCP ports. It is built with SwiftUI and is
+especially handy on machines where Docker runs through Colima instead of Docker
+Desktop.
 
 The app gives you a lightweight desktop view of what is running, which project
-or Compose service a container belongs to, the ports it exposes, and recent
-logs for the selected container.
+or Compose service a container belongs to, which host ports are listening, and
+whether a listener appears to be Docker-backed or a host process.
 
 ## Features
 
@@ -18,6 +19,9 @@ logs for the selected container.
   tail refreshes every 2 seconds.
 - Opens mapped HTTP ports in the browser when Docker reports host bindings.
 - Stops only the selected container with `docker stop <container-id>` and verifies the stopped state.
+- Shows listening local TCP ports from the OS without actively scanning ports.
+- Labels listening ports as Docker-backed when they match a running container's published host port.
+- Closes a selected port with confirmation: Docker-backed ports stop the publishing container, while host-process ports send `SIGTERM` to the owning PID.
 
 ## Requirements
 
@@ -27,7 +31,8 @@ logs for the selected container.
 - Optional: Colima, if you use Colima as the Docker backend.
 
 Container Review searches common Homebrew Docker and Colima paths first, then
-falls back to `env docker` and `env colima`.
+falls back to `env docker` and `env colima`. The Ports view uses `lsof` to ask
+macOS for listening TCP sockets.
 
 ## Run From Source
 
@@ -92,7 +97,9 @@ Pass another version if you are preparing a different release:
 
 Container Review is local-only. It does not send container information anywhere.
 It shells out to the local Docker CLI for container lists, inspection data, logs,
-and stop actions.
+and stop actions. The Ports view shells out to `lsof -nP -iTCP -sTCP:LISTEN`;
+it does not probe or connect to ports. Closing a host-process port sends
+`SIGTERM` to the owning PID after confirmation.
 
 The destructive action in the UI is scoped to the target container: stopping a
 container calls `docker stop` with that container's ID and then verifies the

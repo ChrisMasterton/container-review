@@ -1,4 +1,6 @@
 import AppKit
+import ContainerReviewCore
+import Darwin
 import SwiftUI
 
 struct ContainerSummary: Identifiable, Equatable {
@@ -157,6 +159,82 @@ struct PortMapping: Identifiable, Equatable {
 
     var displayHost: String {
         host.isEmpty ? "localhost" : host
+    }
+}
+
+struct DockerPortSource: Equatable, Hashable {
+    let port: Int
+    let containerID: String
+    let containerName: String
+    let composeProject: String?
+    let composeService: String?
+
+    var displayName: String {
+        switch (composeProject, composeService) {
+        case let (project?, service?):
+            return "\(project) / \(service)"
+        case let (project?, nil):
+            return project
+        case let (nil, service?):
+            return service
+        default:
+            return containerName
+        }
+    }
+}
+
+struct PortListenerSummary: Identifiable, Equatable {
+    let id: String
+    let command: String
+    let pid: Int
+    let user: String
+    let fileDescriptor: String
+    let family: String
+    let endpoint: String
+    let address: String
+    let port: Int
+    let dockerSources: [DockerPortSource]
+
+    init(listener: LsofListener, dockerSources: [DockerPortSource]) {
+        self.id = "\(listener.pid)-\(listener.fileDescriptor)-\(listener.address)-\(listener.port)"
+        self.command = listener.command
+        self.pid = listener.pid
+        self.user = listener.user
+        self.fileDescriptor = listener.fileDescriptor
+        self.family = listener.family
+        self.endpoint = listener.endpoint
+        self.address = listener.address
+        self.port = listener.port
+        self.dockerSources = dockerSources
+    }
+
+    var isDockerBacked: Bool {
+        !dockerSources.isEmpty
+    }
+
+    var originLabel: String {
+        isDockerBacked ? "Docker" : "Host"
+    }
+
+    var sourceText: String {
+        guard let first = dockerSources.first else { return "Not Docker" }
+        if dockerSources.count == 1 { return first.displayName }
+        return "\(first.displayName) + \(dockerSources.count - 1)"
+    }
+
+    var addressText: String {
+        "\(address):\(port)"
+    }
+
+    var pidText: String {
+        "PID \(pid)"
+    }
+
+    var url: URL? {
+        let hostName = address.isEmpty || address == "*" || address == "0.0.0.0" || address == "::" || address == "::1"
+            ? "localhost"
+            : address
+        return URL(string: "http://\(hostName):\(port)")
     }
 }
 
@@ -392,6 +470,27 @@ enum ContainerScope: String, CaseIterable, Identifiable {
     }
 }
 
+enum ReviewMode: String, CaseIterable, Identifiable {
+    case containers
+    case ports
+
+    var id: Self { self }
+
+    var label: String {
+        switch self {
+        case .containers: "Containers"
+        case .ports: "Ports"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .containers: "shippingbox"
+        case .ports: "network"
+        }
+    }
+}
+
 enum CommandError: LocalizedError {
     case commandFailed(command: String, detail: String)
 
@@ -413,6 +512,11 @@ enum ToolRunner {
     static let commonColimaPaths = [
         "/opt/homebrew/bin/colima",
         "/usr/local/bin/colima"
+    ]
+
+    static let commonLsofPaths = [
+        "/usr/sbin/lsof",
+        "/usr/bin/lsof"
     ]
 
     static func executable(named name: String, commonPaths: [String]) -> String {
@@ -516,18 +620,53 @@ enum DockerRunner {
     }
 }
 
+enum PortRunner {
+    static var lsof: String {
+        ToolRunner.executable(named: "lsof", commonPaths: ToolRunner.commonLsofPaths)
+    }
+
+    static func listListeners() async throws -> [LsofListener] {
+        let output = try await ToolRunner.run(lsof, arguments: ["-nP", "-iTCP", "-sTCP:LISTEN"])
+        return LsofListenParser.parse(output)
+    }
+
+    static func terminate(pid: Int) async throws {
+        guard pid > 0 else {
+            throw CommandError.commandFailed(command: "kill -TERM \(pid)", detail: "Invalid process ID.")
+        }
+
+        try await Task.detached(priority: .userInitiated) {
+            let result = Darwin.kill(pid_t(pid), SIGTERM)
+            if result != 0 {
+                let detail = String(cString: strerror(errno))
+                throw CommandError.commandFailed(command: "kill -TERM \(pid)", detail: detail)
+            }
+        }.value
+    }
+}
+
 @MainActor
 final class ContainerStore: ObservableObject {
+    @Published var mode: ReviewMode = .containers {
+        didSet { refreshActive() }
+    }
     @Published var containers: [ContainerSummary] = []
     @Published var selectedContainerID: ContainerSummary.ID?
+    @Published var portListeners: [PortListenerSummary] = []
+    @Published var selectedPortID: PortListenerSummary.ID?
     @Published var detail: ContainerDetail?
     @Published var logs = ""
     @Published var statusText = "Ready"
+    @Published var portStatusText = "Ready"
     @Published var dockerStatusText = "Checking Docker..."
     @Published var isRefreshing = false
+    @Published var isRefreshingPorts = false
     @Published var isLoadingDetail = false
     @Published var isLoadingLogs = false
     @Published var isStopping = false
+    @Published var isClosingPort = false
+    @Published var portCloseCandidate: PortListenerSummary?
+    @Published var hiddenNonRunningContainerCount: Int?
     @Published var followLogs = false {
         didSet { updateLogFollower() }
     }
@@ -542,6 +681,7 @@ final class ContainerStore: ObservableObject {
         }
     }
     @Published var query = ""
+    @Published var portQuery = ""
 
     private var refreshTask: Task<Void, Never>?
     private var logFollowTask: Task<Void, Never>?
@@ -550,6 +690,10 @@ final class ContainerStore: ObservableObject {
 
     var selectedContainer: ContainerSummary? {
         containers.first { $0.id == selectedContainerID }
+    }
+
+    var selectedPort: PortListenerSummary? {
+        portListeners.first { $0.id == selectedPortID }
     }
 
     var filteredContainers: [ContainerSummary] {
@@ -566,6 +710,67 @@ final class ContainerStore: ObservableObject {
         }
     }
 
+    var filteredPortListeners: [PortListenerSummary] {
+        let trimmedQuery = portQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedQuery.isEmpty else { return portListeners }
+        return portListeners.filter { listener in
+            [
+                String(listener.port),
+                listener.command,
+                listener.pidText,
+                listener.user,
+                listener.addressText,
+                listener.sourceText,
+                listener.originLabel
+            ].contains { $0.localizedCaseInsensitiveContains(trimmedQuery) }
+        }
+    }
+
+    var emptyListTitle: String {
+        ContainerListPresentation.emptyTitle(
+            hasVisibleContainers: !containers.isEmpty,
+            isRunningScope: scope == .running,
+            hiddenNonRunningCount: hiddenNonRunningContainerCount
+        )
+    }
+
+    var emptyListDescription: String {
+        ContainerListPresentation.emptyDescription(
+            hasVisibleContainers: !containers.isEmpty,
+            isRunningScope: scope == .running,
+            hiddenNonRunningCount: hiddenNonRunningContainerCount
+        )
+    }
+
+    var menuEmptyText: String {
+        ContainerListPresentation.menuEmptyText(
+            isRunningScope: scope == .running,
+            hiddenNonRunningCount: hiddenNonRunningContainerCount
+        )
+    }
+
+    var canShowHiddenContainers: Bool {
+        scope == .running && containers.isEmpty && (hiddenNonRunningContainerCount ?? 0) > 0
+    }
+
+    var closePortConfirmationTitle: String {
+        guard let listener = portCloseCandidate else { return "Close Port?" }
+        return listener.isDockerBacked ? "Stop Container For Port \(listener.port)?" : "Close Port \(listener.port)?"
+    }
+
+    var closePortConfirmationMessage: String {
+        guard let listener = portCloseCandidate else { return "" }
+        if listener.isDockerBacked {
+            return "This will stop the Docker container publishing port \(listener.port)."
+        }
+        return "This will send SIGTERM to \(listener.command) with PID \(listener.pid)."
+    }
+
+    var closePortButtonTitle: String {
+        guard let listener = portCloseCandidate else { return "Close Port" }
+        return listener.isDockerBacked ? "Stop Container" : "Terminate Process"
+    }
+
     deinit {
         refreshTask?.cancel()
         logFollowTask?.cancel()
@@ -573,19 +778,34 @@ final class ContainerStore: ObservableObject {
 
     func startAutoRefresh() {
         guard refreshTask == nil else { return }
-        refresh()
+        refreshActive()
         refreshDockerStatus()
         refreshTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(4))
-                self?.refresh()
+                self?.refreshActive()
             }
+        }
+    }
+
+    func refreshActive() {
+        switch mode {
+        case .containers:
+            refresh()
+        case .ports:
+            refreshPorts()
         }
     }
 
     func refresh() {
         Task {
             await reloadContainers(scope: scope)
+        }
+    }
+
+    func refreshPorts() {
+        Task {
+            await reloadPortListeners()
         }
     }
 
@@ -603,6 +823,10 @@ final class ContainerStore: ObservableObject {
         lastDetailID = nil
         followLogs = false
         refreshSelectedDetailIfNeeded(force: true)
+    }
+
+    func selectPort(_ id: PortListenerSummary.ID?) {
+        selectedPortID = id
     }
 
     func refreshSelectedDetailIfNeeded(force: Bool = false) {
@@ -643,6 +867,11 @@ final class ContainerStore: ObservableObject {
         NSWorkspace.shared.open(url)
     }
 
+    func openSelectedPort() {
+        guard let url = selectedPort?.url else { return }
+        NSWorkspace.shared.open(url)
+    }
+
     func copySelectedID() {
         let value = detail?.fullID ?? selectedContainerID ?? ""
         guard !value.isEmpty else { return }
@@ -651,9 +880,39 @@ final class ContainerStore: ObservableObject {
         statusText = "Copied container ID"
     }
 
+    func copySelectedPort() {
+        guard let selectedPort else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(String(selectedPort.port), forType: .string)
+        portStatusText = "Copied port \(selectedPort.port)"
+    }
+
+    func requestCloseSelectedPort() {
+        guard let selectedPort else { return }
+        requestClosePort(selectedPort)
+    }
+
+    func requestClosePort(_ listener: PortListenerSummary) {
+        selectedPortID = listener.id
+        portCloseCandidate = listener
+    }
+
+    func cancelClosePort() {
+        portCloseCandidate = nil
+    }
+
+    func confirmClosePort() {
+        guard let listener = portCloseCandidate, !isClosingPort else { return }
+        closePort(listener)
+    }
+
     func stopSelected() {
         guard let selectedContainerID else { return }
         stop(selectedContainerID)
+    }
+
+    func showAllContainers() {
+        scope = .all
     }
 
     func stop(_ id: ContainerSummary.ID) {
@@ -686,12 +945,59 @@ final class ContainerStore: ObservableObject {
         }
     }
 
+    func closePort(_ listener: PortListenerSummary) {
+        guard !isClosingPort else { return }
+        selectedPortID = listener.id
+        isClosingPort = true
+        portStatusText = listener.isDockerBacked
+            ? "Stopping container for port \(listener.port)..."
+            : "Terminating \(listener.command) PID \(listener.pid)..."
+
+        Task {
+            defer {
+                isClosingPort = false
+                portCloseCandidate = nil
+            }
+
+            do {
+                if listener.isDockerBacked {
+                    let uniqueSources = Dictionary(grouping: listener.dockerSources, by: \.containerID)
+                        .values
+                        .compactMap(\.first)
+                    for source in uniqueSources {
+                        _ = try await DockerRunner.stop(id: source.containerID)
+                    }
+                    await reloadContainers(scope: scope)
+                    await reloadPortListeners()
+                    portStatusText = "Stopped \(uniqueSources.count) container\(uniqueSources.count == 1 ? "" : "s") for port \(listener.port)."
+                } else {
+                    try await PortRunner.terminate(pid: listener.pid)
+                    try? await Task.sleep(for: .milliseconds(500))
+                    await reloadPortListeners()
+                    let stillListening = portListeners.contains {
+                        $0.pid == listener.pid && $0.port == listener.port
+                    }
+                    portStatusText = stillListening
+                        ? "Sent SIGTERM to PID \(listener.pid), but port \(listener.port) is still listening."
+                        : "Closed port \(listener.port) by terminating PID \(listener.pid)."
+                }
+            } catch {
+                portStatusText = error.localizedDescription
+            }
+        }
+    }
+
     private func reloadContainers(scope requestedScope: ContainerScope, statusOverride: String? = nil) async {
         isRefreshing = true
         defer { isRefreshing = false }
 
         do {
             let next = sorted(try await DockerRunner.listContainers(scope: requestedScope))
+            if requestedScope == .running, next.isEmpty {
+                hiddenNonRunningContainerCount = try? await DockerRunner.listContainers(scope: .all).count
+            } else {
+                hiddenNonRunningContainerCount = nil
+            }
             containers = next
             if let selectedContainerID, !next.contains(where: { $0.id == selectedContainerID }) {
                 self.selectedContainerID = nil
@@ -699,16 +1005,70 @@ final class ContainerStore: ObservableObject {
                 logs = ""
                 lastDetailID = nil
             }
-            statusText = statusOverride ?? (next.isEmpty
-                ? "No containers found"
-                : "\(next.count) container\(next.count == 1 ? "" : "s") shown")
+            statusText = statusOverride ?? ContainerListPresentation.statusText(
+                visibleCount: next.count,
+                isRunningScope: requestedScope == .running,
+                hiddenNonRunningCount: hiddenNonRunningContainerCount
+            )
             refreshSelectedDetailIfNeeded()
         } catch {
             containers = []
+            hiddenNonRunningContainerCount = nil
             selectedContainerID = nil
             detail = nil
             logs = ""
             statusText = error.localizedDescription
+        }
+    }
+
+    private func reloadPortListeners() async {
+        isRefreshingPorts = true
+        defer { isRefreshingPorts = false }
+
+        do {
+            let listeners = try await PortRunner.listListeners()
+            let dockerSources = await runningDockerPortSources()
+            let dockerSourcesByPort = Dictionary(grouping: dockerSources, by: \.port)
+            let next = listeners
+                .map { listener in
+                    PortListenerSummary(
+                        listener: listener,
+                        dockerSources: dockerSourcesByPort[listener.port] ?? []
+                    )
+                }
+                .sorted { lhs, rhs in
+                    if lhs.port != rhs.port { return lhs.port < rhs.port }
+                    if lhs.address != rhs.address {
+                        return lhs.address.localizedStandardCompare(rhs.address) == .orderedAscending
+                    }
+                    return lhs.command.localizedStandardCompare(rhs.command) == .orderedAscending
+                }
+
+            portListeners = next
+            if let selectedPortID, !next.contains(where: { $0.id == selectedPortID }) {
+                self.selectedPortID = nil
+            }
+            if let portCloseCandidate, !next.contains(where: { $0.id == portCloseCandidate.id }) {
+                self.portCloseCandidate = nil
+            }
+            let dockerCount = next.filter(\.isDockerBacked).count
+            let hostCount = next.count - dockerCount
+            portStatusText = next.isEmpty
+                ? "No listening TCP ports found"
+                : "\(next.count) listener\(next.count == 1 ? "" : "s") shown; \(hostCount) host, \(dockerCount) Docker"
+        } catch {
+            portListeners = []
+            selectedPortID = nil
+            portStatusText = error.localizedDescription
+        }
+    }
+
+    private func runningDockerPortSources() async -> [DockerPortSource] {
+        do {
+            let runningContainers = try await DockerRunner.listContainers(scope: .running)
+            return runningContainers.flatMap(\.publishedPortSources)
+        } catch {
+            return []
         }
     }
 
@@ -760,39 +1120,53 @@ final class ContainerStore: ObservableObject {
     }
 }
 
+extension ContainerSummary {
+    var publishedPortSources: [DockerPortSource] {
+        let publishedPorts = DockerPublishedPortParser.parse(ports)
+        let uniquePorts = Set(publishedPorts.map(\.hostPort))
+        return uniquePorts.sorted().map {
+            DockerPortSource(
+                port: $0,
+                containerID: id,
+                containerName: displayName,
+                composeProject: composeProject,
+                composeService: composeService
+            )
+        }
+    }
+}
+
 struct ContentView: View {
     @EnvironmentObject private var store: ContainerStore
+
+    private var activeSearchText: Binding<String> {
+        Binding(
+            get: { store.mode == .containers ? store.query : store.portQuery },
+            set: {
+                if store.mode == .containers {
+                    store.query = $0
+                } else {
+                    store.portQuery = $0
+                }
+            }
+        )
+    }
+
+    private var closePortConfirmationPresented: Binding<Bool> {
+        Binding(
+            get: { store.portCloseCandidate != nil },
+            set: { if !$0 { store.cancelClosePort() } }
+        )
+    }
 
     var body: some View {
         NavigationSplitView {
             VStack(spacing: 0) {
-                ContainerListHeader()
-
-                List(selection: Binding(
-                    get: { store.selectedContainerID },
-                    set: { store.select($0) }
-                )) {
-                    ForEach(store.filteredContainers) { container in
-                        ContainerRow(container: container)
-                            .tag(container.id)
-                            .contextMenu {
-                                Button("Copy Container ID") { store.copySelectedID() }
-                                Button("Open First Port") { store.openFirstPort() }
-                                    .disabled(store.detail?.ports.compactMap(\.url).isEmpty ?? true)
-                                Button("Stop Container", role: .destructive) { store.stop(container.id) }
-                                    .disabled(store.isStopping || !container.isRunning)
-                            }
-                    }
-                }
-                .listStyle(.sidebar)
-                .overlay {
-                    if store.filteredContainers.isEmpty {
-                        ContentUnavailableView(
-                            store.containers.isEmpty ? "No Containers" : "No Matches",
-                            systemImage: "shippingbox",
-                            description: Text(store.containers.isEmpty ? "Running Docker containers will appear here." : "Try a different filter.")
-                        )
-                    }
+                switch store.mode {
+                case .containers:
+                    ContainerSidebar()
+                case .ports:
+                    PortSidebar()
                 }
 
                 Divider()
@@ -800,38 +1174,175 @@ struct ContentView: View {
             }
             .navigationSplitViewColumnWidth(min: 340, ideal: 420, max: 520)
         } detail: {
-            DetailView()
+            switch store.mode {
+            case .containers:
+                DetailView()
+            case .ports:
+                PortDetailView()
+            }
         }
         .frame(minWidth: 1000, minHeight: 620)
         .toolbar {
-            ToolbarItemGroup {
-                Picker("Scope", selection: $store.scope) {
-                    ForEach(ContainerScope.allCases) { scope in
-                        Text(scope.label).tag(scope)
+            ToolbarItem(placement: .navigation) {
+                Picker("View", selection: $store.mode) {
+                    ForEach(ReviewMode.allCases) { mode in
+                        Label(mode.label, systemImage: mode.systemImage).tag(mode)
                     }
                 }
                 .pickerStyle(.segmented)
+                .frame(width: 190)
+            }
 
-                SortOrderMenu()
+            ToolbarItemGroup {
+                if store.mode == .containers {
+                    Picker("Scope", selection: $store.scope) {
+                        ForEach(ContainerScope.allCases) { scope in
+                            Text(scope.label).tag(scope)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
+                    SortOrderMenu()
+                }
 
                 Button {
-                    store.refresh()
+                    store.refreshActive()
                     store.refreshDockerStatus()
                 } label: {
                     Label("Refresh", systemImage: "arrow.clockwise")
                 }
 
-                Button(role: .destructive) {
-                    store.stopSelected()
-                } label: {
-                    Label("Stop", systemImage: "stop.circle")
+                if store.mode == .ports {
+                    Button {
+                        store.openSelectedPort()
+                    } label: {
+                        Label("Open Port", systemImage: "arrow.up.forward.square")
+                    }
+                    .disabled(store.selectedPort?.url == nil)
+
+                    Button(role: .destructive) {
+                        store.requestCloseSelectedPort()
+                    } label: {
+                        Label("Close Port", systemImage: "xmark.circle")
+                    }
+                    .disabled(store.selectedPort == nil || store.isClosingPort)
                 }
-                .disabled(store.selectedContainer?.isRunning != true || store.isStopping)
+
+                if store.mode == .containers {
+                    Button(role: .destructive) {
+                        store.stopSelected()
+                    } label: {
+                        Label("Stop", systemImage: "stop.circle")
+                    }
+                    .disabled(store.selectedContainer?.isRunning != true || store.isStopping)
+                }
             }
         }
-        .searchable(text: $store.query, placement: .sidebar, prompt: "Filter containers")
+        .searchable(
+            text: activeSearchText,
+            placement: .sidebar,
+            prompt: Text(store.mode == .containers ? "Filter containers" : "Filter ports")
+        )
+        .confirmationDialog(
+            store.closePortConfirmationTitle,
+            isPresented: closePortConfirmationPresented,
+            titleVisibility: .visible
+        ) {
+            Button(store.closePortButtonTitle, role: .destructive) {
+                store.confirmClosePort()
+            }
+            Button("Cancel", role: .cancel) {
+                store.cancelClosePort()
+            }
+        } message: {
+            Text(store.closePortConfirmationMessage)
+        }
         .onAppear {
             store.startAutoRefresh()
+        }
+    }
+}
+
+struct ContainerSidebar: View {
+    @EnvironmentObject private var store: ContainerStore
+
+    var body: some View {
+        ContainerListHeader()
+
+        List(selection: Binding(
+            get: { store.selectedContainerID },
+            set: { store.select($0) }
+        )) {
+            ForEach(store.filteredContainers) { container in
+                ContainerRow(container: container)
+                    .tag(container.id)
+                    .contextMenu {
+                        Button("Copy Container ID") { store.copySelectedID() }
+                        Button("Open First Port") { store.openFirstPort() }
+                            .disabled(store.detail?.ports.compactMap(\.url).isEmpty ?? true)
+                        Button("Stop Container", role: .destructive) { store.stop(container.id) }
+                            .disabled(store.isStopping || !container.isRunning)
+                    }
+            }
+        }
+        .listStyle(.sidebar)
+        .overlay {
+            if store.filteredContainers.isEmpty {
+                ContentUnavailableView {
+                    Label(store.emptyListTitle, systemImage: "shippingbox")
+                } description: {
+                    Text(store.emptyListDescription)
+                } actions: {
+                    if store.canShowHiddenContainers {
+                        Button("Show All Containers") {
+                            store.showAllContainers()
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct PortSidebar: View {
+    @EnvironmentObject private var store: ContainerStore
+
+    var body: some View {
+        PortListHeader()
+
+        List(selection: Binding(
+            get: { store.selectedPortID },
+            set: { store.selectPort($0) }
+        )) {
+            ForEach(store.filteredPortListeners) { listener in
+                PortRow(listener: listener)
+                    .tag(listener.id)
+                    .contextMenu {
+                        Button("Copy Port") {
+                            store.selectPort(listener.id)
+                            store.copySelectedPort()
+                        }
+                        Button("Open Port") {
+                            store.selectPort(listener.id)
+                            store.openSelectedPort()
+                        }
+                        .disabled(listener.url == nil)
+                        Button("Close Port", role: .destructive) {
+                            store.requestClosePort(listener)
+                        }
+                        .disabled(store.isClosingPort)
+                    }
+            }
+        }
+        .listStyle(.sidebar)
+        .overlay {
+            if store.filteredPortListeners.isEmpty {
+                ContentUnavailableView(
+                    store.portListeners.isEmpty ? "No Listening Ports" : "No Matches",
+                    systemImage: "network",
+                    description: Text(store.portListeners.isEmpty ? "No TCP listeners were reported by the OS." : "Try a different filter.")
+                )
+            }
         }
     }
 }
@@ -849,6 +1360,29 @@ struct ContainerListHeader: View {
                 .lineLimit(1)
             Spacer()
             if store.isRefreshing {
+                ProgressView()
+                    .controlSize(.small)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(.bar)
+    }
+}
+
+struct PortListHeader: View {
+    @EnvironmentObject private var store: ContainerStore
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "network")
+                .foregroundStyle(.blue)
+            Text("Listening Ports")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            Spacer()
+            if store.isRefreshingPorts {
                 ProgressView()
                     .controlSize(.small)
             }
@@ -896,6 +1430,49 @@ struct ContainerRow: View {
     }
 }
 
+struct PortRow: View {
+    let listener: PortListenerSummary
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Circle()
+                .fill(listener.isDockerBacked ? Color.green : Color.blue)
+                .frame(width: 9, height: 9)
+                .padding(.top, 5)
+
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 8) {
+                    Text(String(listener.port))
+                        .font(.body.weight(.semibold))
+                        .lineLimit(1)
+                    Text(listener.originLabel)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(listener.isDockerBacked ? .green : .secondary)
+                        .lineLimit(1)
+                    Text(listener.sourceText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                Text("\(listener.command) \(listener.pidText)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+
+                HStack(spacing: 10) {
+                    Label(listener.addressText, systemImage: "network")
+                    Label(listener.family, systemImage: "point.3.connected.trianglepath.dotted")
+                }
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+            }
+        }
+        .padding(.vertical, 5)
+    }
+}
+
 struct DetailView: View {
     @EnvironmentObject private var store: ContainerStore
 
@@ -933,6 +1510,102 @@ struct DetailView: View {
                 )
             }
         }
+    }
+}
+
+struct PortDetailView: View {
+    @EnvironmentObject private var store: ContainerStore
+
+    var body: some View {
+        Group {
+            if let listener = store.selectedPort {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 18) {
+                        PortDetailHeader(listener: listener)
+                        PortMetadataGrid(listener: listener)
+                    }
+                    .padding(24)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            } else {
+                ContentUnavailableView(
+                    "Select a Port",
+                    systemImage: "network",
+                    description: Text("Choose a listening TCP port to inspect the owning process.")
+                )
+            }
+        }
+    }
+}
+
+struct PortDetailHeader: View {
+    @EnvironmentObject private var store: ContainerStore
+    let listener: PortListenerSummary
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .center, spacing: 12) {
+                Image(systemName: listener.isDockerBacked ? "shippingbox.fill" : "macwindow")
+                    .font(.title3)
+                    .foregroundStyle(listener.isDockerBacked ? .green : .blue)
+                Text("Port \(listener.port)")
+                    .font(.title2.weight(.semibold))
+                    .lineLimit(1)
+
+                StatusPill(text: listener.originLabel, style: listener.isDockerBacked ? .good : .neutral)
+                StatusPill(text: listener.family, style: .neutral)
+
+                Spacer()
+            }
+
+            HStack(spacing: 10) {
+                Button { store.copySelectedPort() } label: {
+                    Label("Copy Port", systemImage: "doc.on.doc")
+                }
+
+                Button { store.openSelectedPort() } label: {
+                    Label("Open Port", systemImage: "arrow.up.forward.square")
+                }
+                .disabled(listener.url == nil)
+
+                Button { store.refreshPorts() } label: {
+                    Label("Refresh Ports", systemImage: "arrow.clockwise")
+                }
+                .disabled(store.isRefreshingPorts)
+
+                Button(role: .destructive) { store.requestClosePort(listener) } label: {
+                    Label("Close Port", systemImage: "xmark.circle")
+                }
+                .disabled(store.isClosingPort)
+            }
+            .controlSize(.regular)
+        }
+    }
+}
+
+struct PortMetadataGrid: View {
+    let listener: PortListenerSummary
+
+    var body: some View {
+        Grid(alignment: .leading, horizontalSpacing: 34, verticalSpacing: 8) {
+            GridRow {
+                MetadataColumn(items: [
+                    ("Command", listener.command),
+                    ("PID", String(listener.pid)),
+                    ("User", listener.user),
+                    ("File Descriptor", listener.fileDescriptor),
+                    ("Endpoint", listener.endpoint)
+                ])
+                MetadataColumn(items: [
+                    ("Origin", listener.originLabel),
+                    ("Docker Source", listener.sourceText),
+                    ("Address", listener.address),
+                    ("Port", String(listener.port)),
+                    ("Family", listener.family)
+                ])
+            }
+        }
+        .padding(.vertical, 4)
     }
 }
 
@@ -1314,17 +1987,26 @@ struct StatusBar: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Text(store.statusText)
+            Text(store.mode == .containers ? store.statusText : store.portStatusText)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
             Spacer()
-            Text(store.scope == .running ? "Running only" : "All containers")
+            Text(trailingText)
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+    }
+
+    private var trailingText: String {
+        switch store.mode {
+        case .containers:
+            return store.scope == .running ? "Running only" : "All containers"
+        case .ports:
+            return "Listening ports"
+        }
     }
 }
 
@@ -1333,8 +2015,17 @@ struct MenuBarContent: View {
 
     var body: some View {
         Button("Refresh") {
-            store.refresh()
+            store.refreshActive()
             store.refreshDockerStatus()
+        }
+
+        Menu("View") {
+            ForEach(ReviewMode.allCases) { mode in
+                Button(mode.label) {
+                    store.mode = mode
+                    NSApp.activate(ignoringOtherApps: true)
+                }
+            }
         }
 
         Menu("Scope") {
@@ -1342,22 +2033,38 @@ struct MenuBarContent: View {
                 Button(scope.label) { store.scope = scope }
             }
         }
+        .disabled(store.mode != .containers)
 
         Menu("Sort By") {
             ForEach(ContainerSortOrder.allCases) { order in
                 Button(order.label) { store.sortOrder = order }
             }
         }
+        .disabled(store.mode != .containers)
 
         Divider()
 
-        if store.containers.isEmpty {
-            Text("No containers")
-        } else {
-            ForEach(store.containers.prefix(20)) { container in
-                Button(container.displayName) {
-                    store.select(container.id)
-                    NSApp.activate(ignoringOtherApps: true)
+        switch store.mode {
+        case .containers:
+            if store.containers.isEmpty {
+                Text(store.menuEmptyText)
+            } else {
+                ForEach(store.containers.prefix(20)) { container in
+                    Button(container.displayName) {
+                        store.select(container.id)
+                        NSApp.activate(ignoringOtherApps: true)
+                    }
+                }
+            }
+        case .ports:
+            if store.portListeners.isEmpty {
+                Text("No listening ports")
+            } else {
+                ForEach(store.portListeners.prefix(20)) { listener in
+                    Button(":\(listener.port) \(listener.command)") {
+                        store.selectPort(listener.id)
+                        NSApp.activate(ignoringOtherApps: true)
+                    }
                 }
             }
         }
@@ -1398,10 +2105,17 @@ struct ContainerReviewApp: App {
         .commands {
             CommandGroup(after: .newItem) {
                 Button("Refresh Containers") {
+                    store.mode = .containers
                     store.refresh()
                     store.refreshDockerStatus()
                 }
                 .keyboardShortcut("r", modifiers: [.command])
+
+                Button("Refresh Ports") {
+                    store.mode = .ports
+                    store.refreshPorts()
+                }
+                .keyboardShortcut("p", modifiers: [.command])
 
                 Button("Refresh Logs") {
                     store.refreshLogsButton()

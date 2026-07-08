@@ -10,8 +10,16 @@ let package = Package(
         .executable(name: "ContainerReview", targets: ["ContainerReview"])
     ],
     targets: [
+        .target(
+            name: "ContainerReviewCore"
+        ),
         .executableTarget(
-            name: "ContainerReview"
+            name: "ContainerReview",
+            dependencies: ["ContainerReviewCore"]
+        ),
+        .testTarget(
+            name: "ContainerReviewCoreTests",
+            dependencies: ["ContainerReviewCore"]
         )
     ]
 )
